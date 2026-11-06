@@ -29,3 +29,7 @@ frontend/build/
 .idea/
 .DS_Store
 Thumbs.db
+backend/test.pdf
+backend/test.png
+backend/test_valid.pdf
+backend/revised_poster.pdf
