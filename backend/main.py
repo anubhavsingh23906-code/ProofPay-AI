@@ -5,7 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from sqlalchemy.orm import Session
 from uuid import UUID, uuid4
-import ollama
 import json
 from typing import Annotated
 from schemas import (
@@ -31,8 +30,8 @@ from paypal_service import (
 
 from database import Base, engine, get_db
 from models import Task as TaskModel
-from config import CORS_ORIGINS, OLLAMA_HOST, OLLAMA_MODEL, PAYPAL_TEST_AMOUNT, PAYPAL_TEST_CURRENCY
-import requests
+from config import CORS_ORIGINS, PAYPAL_TEST_AMOUNT, PAYPAL_TEST_CURRENCY
+from ai_service import AIServiceError, generate_structured, provider_health
 
 # --------------------------------------------------
 # FILE UPLOAD CONFIGURATION
@@ -175,19 +174,10 @@ def home():
 
 @app.get("/health")
 def health_check():
-    ollama_status = "unavailable"
-    try:
-        ping = requests.get(f"{OLLAMA_HOST.rstrip('/')}/api/tags", timeout=2)
-        if ping.ok:
-            ollama_status = "available"
-    except requests.RequestException:
-        ollama_status = "unavailable"
-
     return {
         "status": "healthy",
         "database": "ok",
-        "ollama": ollama_status,
-        "ai_model": OLLAMA_MODEL,
+        **provider_health(),
     }
 
 
@@ -317,19 +307,10 @@ Return only data matching the requested JSON schema.
 """
 
     try:
-        response = ollama.generate(
-            model=OLLAMA_MODEL,
-            prompt=prompt,
-            format=Agreement.model_json_schema(),
-            options={
-                "temperature": 0,
-                "num_ctx": 2048
-            },
-            stream=False
-        )
-
-        agreement = Agreement.model_validate_json(
-            response["response"]
+        agreement = generate_structured(
+            prompt,
+            Agreement,
+            operation="agreement",
         )
 
         task.agreement = agreement.model_dump()
@@ -351,14 +332,17 @@ Return only data matching the requested JSON schema.
 
     except HTTPException:
         raise
-    except Exception as e:
+    except AIServiceError as exc:
         db.rollback()
-        print(f"Agreement generation error: {e}")
-
+        print(f"Agreement generation error: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail=exc.detail) from None
+    except Exception:
+        db.rollback()
+        print("Agreement generation error: unexpected failure")
         raise HTTPException(
             status_code=502,
-            detail="AI agreement generation is unavailable. Start Ollama with model qwen3:1.7b, then try again.",
-        )
+            detail="AI agreement generation is unavailable. Nothing was saved.",
+        ) from None
 
 
 # --------------------------------------------------
@@ -865,40 +849,32 @@ STRICT VERIFICATION RULES:
 Return only valid JSON matching the requested schema.
 """
 
-    # 6. CALL LOCAL QWEN MODEL
+    # 6. CALL THE CONFIGURED AI PROVIDER
 
     try:
 
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a strict evidence verification "
-                        "assistant. Return structured JSON only."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            format=VerificationResult.model_json_schema()
+        result = generate_structured(
+            prompt,
+            VerificationResult,
+            system=(
+                "You are a strict evidence verification "
+                "assistant. Return structured JSON only."
+            ),
+            operation="verification",
         )
 
-        raw_result = response["message"]["content"]
-
-        result = VerificationResult.model_validate_json(
-            raw_result
-        )
-
-    except Exception as e:
-
+    except AIServiceError as exc:
+        print(f"Work verification error: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail=exc.detail) from None
+    except Exception:
+        print("Work verification error: unexpected failure")
         raise HTTPException(
             status_code=502,
-            detail="AI verification is unavailable. Start Ollama with the configured model, then try again.",
-        )
+            detail=(
+                "AI verification is unavailable. "
+                "The submission was not marked verified."
+            ),
+        ) from None
 
     # 7. VALIDATE AI OUTPUT AGAINST AGREEMENT
 

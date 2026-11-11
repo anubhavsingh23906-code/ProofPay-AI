@@ -43,6 +43,12 @@ CORS_ORIGINS = _split_origins(
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 
+# ollama: local development. gemini: hosted provider (Render). No automatic fallback.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").strip().lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Fast, low-cost text model. Override GEMINI_MODEL without changing code.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
+
 # Technical PayPal Sandbox test amount. This is NOT converted from INR.
 PAYPAL_TEST_AMOUNT = "1.00"
 PAYPAL_TEST_CURRENCY = "USD"

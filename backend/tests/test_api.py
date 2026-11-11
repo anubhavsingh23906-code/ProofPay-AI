@@ -1,6 +1,8 @@
 import json
 from unittest.mock import patch
 
+from ai_service import AIServiceError
+from schemas import Agreement, VerificationResult
 from models import Task as TaskModel
 from database import get_db
 
@@ -241,7 +243,7 @@ def test_generate_agreement_saves_draft(client):
         "revision_count": 0,
     }
 
-    with patch("main.ollama.generate", return_value={"response": json.dumps(fake_agreement)}):
+    with patch("main.generate_structured", return_value=Agreement.model_validate(fake_agreement)):
         response = client.post(f"/tasks/{task_id}/generate-agreement")
 
     assert response.status_code == 200
@@ -251,6 +253,129 @@ def test_generate_agreement_saves_draft(client):
     approve = client.post(f"/tasks/{task_id}/approve-agreement", json={"approved": True})
     assert approve.status_code == 200
     assert approve.json()["status"] == "approved"
+
+
+def test_generate_agreement_does_not_save_malformed_ai_output(client):
+    task_id = client.post("/tasks", json=SAMPLE_TASK).json()["task_id"]
+
+    with patch(
+        "main.generate_structured",
+        side_effect=AIServiceError(
+            "AI agreement generation is unavailable. "
+            "The model response was not valid structured JSON. Nothing was saved."
+        ),
+    ):
+        response = client.post(f"/tasks/{task_id}/generate-agreement")
+
+    assert response.status_code == 502
+    assert "Nothing was saved" in response.json()["detail"]
+    fetched = client.get(f"/tasks/{task_id}")
+    assert fetched.json()["status"] == "draft"
+    assert fetched.json()["agreement"] is None
+
+
+def test_verify_work_saves_advisory_result(client):
+    task_id = client.post("/tasks", json=SAMPLE_TASK).json()["task_id"]
+    agreement = {
+        "deliverables": ["Poster PDF"],
+        "acceptance_criteria": ["Includes product name"],
+        "client_must_provide": [],
+        "assumptions_or_questions": [],
+        "revision_count": 0,
+    }
+    with patch("main.generate_structured", return_value=Agreement.model_validate(agreement)):
+        assert client.post(f"/tasks/{task_id}/generate-agreement").status_code == 200
+    assert client.post(
+        f"/tasks/{task_id}/approve-agreement",
+        json={"approved": True},
+    ).status_code == 200
+
+    pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+    uploaded = client.post(
+        f"/tasks/{task_id}/upload-files",
+        files=[("files", ("poster.pdf", pdf, "application/pdf"))],
+    )
+    assert uploaded.status_code == 200
+
+    submitted = client.post(
+        f"/tasks/{task_id}/submit-work",
+        json={"submission_text": "Poster PDF is attached.", "file_names": ["poster.pdf"]},
+    )
+    assert submitted.status_code == 200
+
+    verification = VerificationResult(
+        completed_requirements=["Poster PDF"],
+        missing_requirements=[],
+        unclear_requirements=["Includes product name"],
+        feedback="Text evidence is incomplete.",
+        recommendation="manual_review",
+    )
+    with patch("main.extract_pdf_text", return_value="Poster PDF for the launch"), patch(
+        "main.generate_structured",
+        return_value=verification,
+    ):
+        response = client.post(f"/tasks/{task_id}/verify-work")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["client_must_make_final_decision"] is True
+    assert body["verification"]["recommendation"] == "manual_review"
+    assert body["status"] == "verification_completed"
+    assert "payment" not in body
+
+
+def test_verify_work_failure_does_not_mark_verified(client):
+    task_id = client.post("/tasks", json=SAMPLE_TASK).json()["task_id"]
+    agreement = {
+        "deliverables": ["Poster PDF"],
+        "acceptance_criteria": ["Includes product name"],
+        "client_must_provide": [],
+        "assumptions_or_questions": [],
+        "revision_count": 0,
+    }
+    with patch("main.generate_structured", return_value=Agreement.model_validate(agreement)):
+        assert client.post(f"/tasks/{task_id}/generate-agreement").status_code == 200
+    client.post(f"/tasks/{task_id}/approve-agreement", json={"approved": True})
+    pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+    assert client.post(
+        f"/tasks/{task_id}/upload-files",
+        files=[("files", ("poster.pdf", pdf, "application/pdf"))],
+    ).status_code == 200
+    client.post(
+        f"/tasks/{task_id}/submit-work",
+        json={"submission_text": "Poster PDF is attached.", "file_names": ["poster.pdf"]},
+    )
+
+    with patch("main.extract_pdf_text", return_value="Poster PDF"), patch(
+        "main.generate_structured",
+        side_effect=AIServiceError(
+            "AI verification is unavailable. The Gemini request failed. "
+            "Try again later. The submission was not marked verified."
+        ),
+    ):
+        response = client.post(f"/tasks/{task_id}/verify-work")
+
+    assert response.status_code == 502
+    assert "not marked verified" in response.json()["detail"]
+    fetched = client.get(f"/tasks/{task_id}")
+    assert fetched.json()["status"] == "submitted"
+    assert fetched.json()["verification"] is None
+
+
+def test_health_reports_selected_gemini_provider(client, monkeypatch):
+    monkeypatch.setattr("ai_service.AI_PROVIDER", "gemini")
+    monkeypatch.setattr("ai_service.GEMINI_API_KEY", "")
+    monkeypatch.setattr("ai_service.GEMINI_MODEL", "gemini-2.5-flash")
+    with patch("ai_service.requests.get") as get:
+        response = client.get("/health")
+    assert response.status_code == 200
+    get.assert_not_called()
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert body["ai_provider"] == "gemini"
+    assert body["ai_model"] == "gemini-2.5-flash"
+    assert body["ai"] == "missing_api_key"
+    assert body["ollama"] == "not_selected"
 
 
 def test_submit_work_requires_approved_agreement(client):

@@ -1,3 +1,8 @@
+import os
+
+# Keep the suite on the local provider even if backend/.env selects Gemini.
+os.environ["AI_PROVIDER"] = "ollama"
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
